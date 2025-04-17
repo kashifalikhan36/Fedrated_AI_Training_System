@@ -9,10 +9,10 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
-import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException
+import requests
 import uvicorn
+from datasets import load_dataset
 
 # Set up logging
 logging.basicConfig(
@@ -23,24 +23,25 @@ logging.basicConfig(
 # Allow dynamic GPU memory allocation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# Global dataset for the server to partition among clients
+server_dataset = None
+
 
 ##############################
 #      LOCAL TRAINING CODE   #
 ##############################
 
-def train(hyperparams):
+def train(hyperparams, problems, answers):
     """
-    Performs local training using your provided single-GPU training code.
-    Hyperparameters (with defaults) are passed in as a dict.
-    Returns the model state as a bytes object.
+    Performs local training on a single GPU (or CPU if CUDA not available).
+    Receives:
+      hyperparams (dict)
+      problems (list of text entries)
+      answers (list of text entries)
+    Returns model state as bytes.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"[Client] Running single GPU training on {device}...")
-
-    # Load dataset
-    dataset = load_dataset("open-r1/OpenR1-Math-220k", split="train")
-    problems = dataset["problem"]
-    answers = dataset["answer"]
 
     # Hyperparameters
     lr = hyperparams.get("lr", 2e-5)
@@ -52,10 +53,10 @@ def train(hyperparams):
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Define Dataset class
+    # Define local Dataset class
     class TextDataset(Dataset):
-        def __init__(self, problems, answers, tokenizer, max_length):
-            self.texts = [p + " " + a for p, a in zip(problems, answers)]
+        def __init__(self, problems_list, answers_list, tokenizer, max_length):
+            self.texts = [p + " " + a for p, a in zip(problems_list, answers_list)]
             self.tokenizer = tokenizer
             self.max_length = max_length
 
@@ -124,16 +125,18 @@ def train(hyperparams):
 def aggregate_models(state_dicts):
     """
     Simple federated averaging:
-      For each key in the state dict, averages the corresponding tensors.
+      For each key in the state dict, average the corresponding tensors.
     """
     aggregated_state = {}
     # Initialize with zeros using the first client's state
     for key in state_dicts[0].keys():
         aggregated_state[key] = torch.zeros_like(state_dicts[0][key])
+
     # Sum up all client states
     for state in state_dicts:
         for key in state.keys():
             aggregated_state[key] += state[key]
+
     # Average
     for key in aggregated_state:
         aggregated_state[key] /= len(state_dicts)
@@ -144,12 +147,21 @@ def aggregate_models(state_dicts):
 #        FASTAPI SERVER      #
 ##############################
 
-def run_server(port):
+def run_server(port, expected_clients):
     """
-    The server (CPU-based) provides hyperparameters and accepts the aggregated model.
+    CPU-based server:
+      1) Loads the dataset once globally (to partition among clients).
+      2) Provides hyperparameters.
+      3) Provides dataset shards to each client upon request.
+      4) Receives final aggregated model.
     """
+    global server_dataset
+    logging.info("[Server] Loading dataset for partitioning...")
+    server_dataset = load_dataset("open-r1/OpenR1-Math-220k")
+
     app = FastAPI()
-    # Define hyperparameters; these may be updated dynamically
+
+    # Define hyperparameters; these may be updated dynamically if needed
     hyperparams = {
         "lr": 2e-5,
         "epochs": 2,
@@ -160,6 +172,32 @@ def run_server(port):
     @app.get("/get_hyperparameters")
     async def get_hyperparameters():
         return hyperparams
+
+    @app.get("/get_dataset_shard")
+    async def get_dataset_shard(client_id: int, total_clients: int):
+        """
+        Returns a partition of the training dataset specific to the client_id.
+        """
+        if not server_dataset or "train" not in server_dataset:
+            raise HTTPException(status_code=500, detail="Server dataset not initialized properly.")
+
+        if client_id < 0 or client_id >= total_clients:
+            raise HTTPException(status_code=400, detail="Invalid client_id or total_clients.")
+
+        train_data = server_dataset["train"]
+        dataset_len = len(train_data)
+        shard_size = dataset_len // total_clients
+        start_idx = client_id * shard_size
+        end_idx = start_idx + shard_size
+
+        # Include remainder in the last shard if dataset doesn't split evenly
+        if client_id == (total_clients - 1):
+            end_idx = dataset_len
+
+        subset = train_data.select(range(start_idx, end_idx))
+        problems = subset["problem"]
+        answers = subset["answer"]
+        return {"problems": problems, "answers": answers}
 
     @app.post("/upload_model")
     async def upload_model(model: UploadFile = File(...)):
@@ -228,8 +266,10 @@ def run_aggregator(port, server_addr, expected_clients):
             logging.error(f"[Aggregator] Failed to send aggregated model: {e}")
         client_models = []
 
-    logging.info(f"[Aggregator] Starting aggregator on port {port} expecting {expected_clients} clients.\n"
-                 f"Aggregated model will be sent to server at {server_addr_global}")
+    logging.info(
+        f"[Aggregator] Starting aggregator on port {port} expecting {expected_clients} clients.\n"
+        f"Aggregated model will be sent to server at {server_addr_global}"
+    )
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
@@ -237,10 +277,13 @@ def run_aggregator(port, server_addr, expected_clients):
 #         FASTAPI CLIENT     #
 ##############################
 
-def run_client(aggregator_addr, server_addr):
+def run_client(aggregator_addr, server_addr, client_id, total_clients):
     """
-    The client (GPU-based) fetches hyperparameters from the server, performs local training,
-    and uploads its trained model to the aggregator.
+    Client (GPU-based):
+      1) Fetches hyperparameters from the server.
+      2) Requests its dataset shard from the server.
+      3) Performs local training on that shard.
+      4) Uploads the trained model to the aggregator.
     """
     try:
         response = requests.get(f"{server_addr}/get_hyperparameters")
@@ -250,8 +293,22 @@ def run_client(aggregator_addr, server_addr):
         logging.error(f"[Client] Failed to retrieve hyperparameters: {e}")
         return
 
-    # Perform local training using the provided training function
-    model_bytes = train(hyperparams)
+    # Request dataset shard
+    try:
+        shard_resp = requests.get(
+            f"{server_addr}/get_dataset_shard",
+            params={"client_id": client_id, "total_clients": total_clients}
+        )
+        shard_data = shard_resp.json()
+        problems = shard_data["problems"]
+        answers = shard_data["answers"]
+        logging.info(f"[Client] Received dataset shard: {len(problems)} samples")
+    except Exception as e:
+        logging.error(f"[Client] Failed to retrieve dataset shard: {e}")
+        return
+
+    # Perform local training
+    model_bytes = train(hyperparams, problems, answers)
 
     # Upload the model to the aggregator
     buffer = io.BytesIO(model_bytes)
@@ -282,11 +339,15 @@ if __name__ == "__main__":
     parser.add_argument("--server_addr", type=str,
                         help="For client/aggregator role: server's address (e.g., http://<server_ip>:<port>)")
     parser.add_argument("--expected_clients", type=int, default=2,
-                        help="(For aggregator) Expected number of client updates before aggregation")
+                        help="(For aggregator/server) Expected number of client updates before aggregation")
+    parser.add_argument("--client_id", type=int, default=0,
+                        help="(For client) Client index ID (0-based)")
+    parser.add_argument("--total_clients", type=int, default=2,
+                        help="(For client) Total number of clients participating")
     args = parser.parse_args()
 
     if args.role == "server":
-        run_server(args.port)
+        run_server(args.port, args.expected_clients)
     elif args.role == "aggregator":
         if not args.server_addr:
             logging.error("Aggregator role requires --server_addr")
@@ -296,4 +357,4 @@ if __name__ == "__main__":
         if not args.aggregator_addr or not args.server_addr:
             logging.error("Client role requires --aggregator_addr and --server_addr")
             exit(1)
-        run_client(args.aggregator_addr, args.server_addr)
+        run_client(args.aggregator_addr, args.server_addr, args.client_id, args.total_clients)
