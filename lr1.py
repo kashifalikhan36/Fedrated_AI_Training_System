@@ -87,11 +87,17 @@ def train(hyperparams, problems, answers):
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scaler = GradScaler()
 
+    # Variables to track training time
+    total_steps = len(dataloader) * epochs
+    start_time = time.time()
+
     # Training loop
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
         for step, batch in enumerate(dataloader):
+            step_start = time.time()
+
             inputs = batch["input_ids"].to(device)
             labels = inputs.clone()
 
@@ -105,8 +111,20 @@ def train(hyperparams, problems, answers):
             optimizer.zero_grad()
 
             epoch_loss += loss.item()
+
+            # Print progress every 10 steps
             if step % 10 == 0:
                 logging.info(f"[Epoch {epoch} | Step {step}] Loss: {loss.item():.4f}")
+
+            # Estimate remaining time
+            done_steps = epoch * len(dataloader) + (step + 1)
+            elapsed = time.time() - start_time
+            avg_time_per_step = elapsed / done_steps
+            remaining_steps = total_steps - done_steps
+            remaining_time = avg_time_per_step * remaining_steps
+            # Print out the approximate remaining time every 10 steps
+            if step % 10 == 0:
+                logging.info(f"[Client] Approx. remaining time: {remaining_time:.2f} seconds")
 
         logging.info(f"[Epoch {epoch}] Avg Loss: {epoch_loss/len(dataloader):.4f}")
 
