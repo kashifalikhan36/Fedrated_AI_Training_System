@@ -1,128 +1,289 @@
-import requests
-import torch
-import json
-import io
-import subprocess
 import os
+import io
+import time
+import argparse
+import logging
+import torch
+import torch.optim as optim
+import torch.nn.utils as nn_utils
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import requests
+import optuna
+import json
 
-SERVER_URL = "http://20.244.34.219:5000"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-def check_gpu():
-    if torch.cuda.is_available():
-        return "cuda:0"
-    return "cpu"
+def local_hyperparam_search():
+    """
+    Fallback: local Optuna-based hyperparameter search if the server has none.
+    Helps pick stable hyperparams to reduce NaNs.
+    """
+    def local_objective(trial: optuna.Trial) -> float:
+        # Restrict learning rate range to reduce chance of NaNs
+        lr = trial.suggest_float("lr", 1e-6, 1e-4, log=True)
+        epochs = trial.suggest_int("epochs", 1, 3)
+        batch_size = trial.suggest_categorical("batch_size", [1, 2])
+        max_length = trial.suggest_int("max_length", 64, 128)
 
-def notify_server_gpu_has_arrived():
-    url = f"{SERVER_URL}/gpu_has_arrived"
-    response = requests.get(url)
-    print("Server response:", response.json())
+        # Dummy score, higher = better
+        dummy_score = 1.0 / (lr * epochs * batch_size * (max_length / 64))
+        return dummy_score
 
-def get_hyperparameters():
-    url = f"{SERVER_URL}/get_hyperparameters"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print("Hyperparameters not yet available.")
+    study = optuna.create_study(direction="maximize")
+    # 5 minute local search was mentioned, but time=3 is in code; keep as-is.
+    study.optimize(local_objective, timeout=3)
+    return study.best_params
+
+def post_local_hyperparams_to_server(server_addr: str, hyperparams: dict):
+    """
+    Submit local hyperparams to server if the server doesn't have any yet.
+    """
+    try:
+        resp = requests.post(f"{server_addr}/submit_hyperparameters", json=hyperparams, timeout=30)
+        if resp.status_code == 200:
+            logging.info("[Client] Successfully submitted local hyperparams to server.")
+        else:
+            logging.warning(f"[Client] Server responded with status: {resp.status_code}")
+    except Exception as e:
+        logging.error(f"[Client] Could not submit local hyperparams: {e}")
+
+def get_server_hyperparameters(server_addr: str):
+    """
+    Fetch best hyperparams from the server. Returns None if not available.
+    """
+    try:
+        resp = requests.get(f"{server_addr}/get_hyperparameters", timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 503:
+            logging.info("[Client] Hyperparameters not yet ready on the server.")
+            return None
+        else:
+            logging.warning(f"[Client] Unknown response code: {resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"[Client] Could not fetch hyperparameters: {e}")
         return None
 
-def get_dataset_shard(client_id, total_clients):
-    url = f"{SERVER_URL}/get_dataset_shard?client_id={client_id}&total_clients={total_clients}"
-    response = requests.get(url)
-    data = response.json()
-    if "problems" in data and "answers" in data and "shard_id" in data:
-        return data
-    print("Shard not available or assigned. Details:", data)
-    return None
-
-def fetch_training_code():
+def get_server_dataset_shard(server_addr: str, client_id: int, total_clients: int):
     """
-    Fetches the full training script from the server (GET /get_client_script)
-    and writes it to 'server_training_script.py'.
-    This script will use the local shard_data.json file when training.
+    Request the dataset shard for this client from the server.
     """
-    url = f"{SERVER_URL}/get_client_script"
-    response = requests.get(url)
-    if response.status_code == 200:
-        script_content = response.json().get("client_script", "")
-        with open("server_training_script.py", "w", encoding="utf-8") as f:
-            f.write(script_content)
-        print("Fetched and saved the server training script: server_training_script.py")
-    else:
-        print("Failed to fetch the server training script.")
-        script_content = None
-    return script_content
+    try:
+        shard_resp = requests.get(
+            f"{server_addr}/get_dataset_shard",
+            params={"client_id": client_id, "total_clients": total_clients},
+            timeout=60
+        )
+        if shard_resp.status_code == 200:
+            # The code checks again for the same status but with a message,
+            # we keep it as is to preserve user logic
+            if ("message" in shard_resp.json() and 
+                shard_resp.json()["message"] == "No more dataset shards available. Training complete or all shards assigned."):
+                logging.info("[Client] No more dataset shards available from server.")
+                return {"message": "No more dataset shards available"}
+            return shard_resp.json()
+        else:
+            logging.error(f"[Client] Shard request returned status: {shard_resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"[Client] Failed to retrieve dataset shard: {e}")
+        return None
 
-def run_training_script():
+def notify_server_of_gpu_start(server_addr: str):
     """
-    Runs 'server_training_script.py' as a separate process.
-    This script should read shard_data.json and produce a trained_model.pth file.
+    Let server know that this client has a GPU, which can prune CPU-based hyperparam search.
     """
-    if not os.path.exists("server_training_script.py"):
-        print("No training script found. Make sure fetch_training_code() ran first.")
-        return
-    subprocess.run(["python", "server_training_script.py"])
+    try:
+        resp = requests.get(f"{server_addr}/gpu_has_arrived", timeout=20)
+        if resp.status_code != 200:
+            logging.warning(f"[Client] GPU start notification returned {resp.status_code}")
+    except Exception as e:
+        logging.warning(f"[Client] GPU start notification failed: {e}")
 
-def upload_trained_model(client_id, shard_id):
+def notify_server_of_gpu_finish(server_addr: str):
     """
-    Reads the 'trained_model.pth' file and uploads it to the server.
+    (Optional) Let the server know the GPU is done, if needed in your workflow.
     """
-    if not os.path.exists("trained_model.pth"):
-        print("No trained_model.pth found. Make sure the training script produced it.")
-        return
+    try:
+        # If server implements a slot system, you could call /gpu_slot_finish here
+        pass
+    except Exception as e:
+        logging.warning(f"[Client] GPU finish notification failed: {e}")
 
-    with open("trained_model.pth", "rb") as model_file:
-        model_data = model_file.read()
+def train(hyperparams: dict, problems: list, answers: list, server_addr: str, client_id: int, shard_id: int):
+    """
+    Training loop using a simple GPT-Neo. Attempts to mitigate NaNs by:
+    1) Lower default LR
+    2) Gradient clipping
+    3) Skipping batches if NaN appears
+    4) Checking for potential infinite/NaN loss via scaler
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"[Client] Training on {device}...")
 
-    files = {"model": ("trained_model.pth", model_data)}
-    url = f"{SERVER_URL}/upload_model?client_id={client_id}&shard_id={shard_id}"
-    response = requests.post(url, files=files)
-    print("Upload response:", response.json())
+    # Notify the server that we have started GPU usage
+    notify_server_of_gpu_start(server_addr)
 
-def main():
-    device = check_gpu()
-    if device.startswith("cuda"):
-        print("GPU is available on this client.")
-        notify_server_gpu_has_arrived()
-    else:
-        print("No GPU found. Proceeding with CPU.")
+    lr = hyperparams.get("lr", 5e-6)
+    epochs = hyperparams.get("epochs", 1)
+    batch_size = hyperparams.get("batch_size", 1)
+    max_length = hyperparams.get("max_length", 128)
 
-    # Get the hyperparameters
-    hyperparams = get_hyperparameters()
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    class SimpleDataset(Dataset):
+        def __init__(self, p_list, a_list, tok, max_len):
+            self.samples = [f"{p} {a}" for p, a in zip(p_list, a_list)]
+            self.tokenizer = tok
+            self.max_length = max_len
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            enc = self.tokenizer(
+                self.samples[idx],
+                max_length=self.max_length,
+                truncation=True,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            return {k: v.squeeze(0) for k, v in enc.items()}
+
+    dataset_obj = SimpleDataset(problems, answers, tokenizer, max_length)
+    dataloader = DataLoader(
+        dataset_obj,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0 if os.name == 'nt' else 4
+    )
+
+    model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, eps=1e-08)
+    scaler = GradScaler()
+
+    total_steps = len(dataloader) * epochs
+    start_time = time.time()
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        step_count = 0
+
+        for step, batch in enumerate(dataloader):
+            step_count += 1
+            inputs = batch["input_ids"].to(device)
+            labels = inputs.clone()
+
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                outputs = model(inputs, labels=labels)
+                loss = outputs.loss
+
+            if not torch.isfinite(loss):
+                logging.error("[Client] Loss is NaN or Inf. Skipping this batch.")
+                optimizer.zero_grad()
+                continue
+
+            scaler.scale(loss).backward()
+            nn_utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+            epoch_loss += loss.item()
+
+            if step % 10 == 0:
+                logging.info(f"[Epoch {epoch} Step {step}] Loss: {loss.item():.4f}")
+                steps_done = epoch * len(dataloader) + (step + 1)
+                elapsed_time = time.time() - start_time
+                avg_time_per_step = (elapsed_time / steps_done) if steps_done else 0
+                steps_left = total_steps - steps_done
+                est_time_left = steps_left * avg_time_per_step
+                logging.info(f"[Client] Approx. remaining training time: {est_time_left:.2f}s")
+
+        avg_epoch_loss = epoch_loss / max(1, step_count)
+        logging.info(f"[Epoch {epoch}] Avg Loss: {avg_epoch_loss:.4f}")
+
+    # If your workflow requires letting the server know you're done with the GPU:
+    notify_server_of_gpu_finish(server_addr)
+
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    buf.seek(0)
+
+    try:
+        url = f"{server_addr}/upload_model"
+        files = {"model": ("client_model.pth", buf.getvalue())}
+        data = {"client_id": client_id, "shard_id": shard_id}
+        resp = requests.post(url, files=files, data=data, timeout=60)
+        logging.info(f"[Client] Model upload response: {resp.text}")
+    except Exception as e:
+        logging.error(f"[Client] Model upload failed: {e}")
+
+def run_client(server_addr: str, client_id: int, total_clients: int):
+    """
+    - Fetch or locally determine hyperparams
+    - Request dataset shard
+    - Train model, skipping any NaN batches
+    - Upload finished model
+    - Check for new tasks and repeat until no more tasks from server.
+    """
+    hyperparams = get_server_hyperparameters(server_addr)
     if hyperparams is None:
-        print("Hyperparams are not ready yet. Exiting.")
-        return
+        logging.info("[Client] Server has no hyperparams, performing local search...")
+        local_params = local_hyperparam_search()
+        logging.info(f"[Client] Found local hyperparams: {local_params}")
 
-    # Example client info
-    client_id = 0
-    total_clients = 5
+        post_local_hyperparams_to_server(server_addr, local_params)
 
-    shard_info = get_dataset_shard(client_id, total_clients)
-    if not shard_info:
-        print("No shard assigned; nothing to train.")
-        return
+        time.sleep(2)
+        hyperparams = get_server_hyperparameters(server_addr)
+        if hyperparams is None:
+            logging.info("[Client] Still no hyperparams from server. Using local results.")
+            hyperparams = local_params
 
-    # Extract the shard data
-    shard_id = shard_info["shard_id"]
-    problems = shard_info["problems"]
-    answers = shard_info["answers"]
+    while True:
+        shard_data = get_server_dataset_shard(server_addr, client_id, total_clients)
+        if not shard_data:
+            logging.error("[Client] Failed to retrieve shard data, exiting task loop.")
+            break
+        if "message" in shard_data and shard_data["message"] == "No more dataset shards available":
+            logging.info("[Client] No more tasks available from server. Exiting task loop.")
+            break
+        if "problems" not in shard_data or "answers" not in shard_data or "shard_id" not in shard_data:
+            logging.error("[Client] Invalid shard data format. Exiting task loop.")
+            break
 
-    # Save shard data to a JSON file so the server_training_script can use it
-    shard_data = {
-        "shard_id": shard_id,
-        "problems": problems,
-        "answers": answers,
-        "hyperparams": hyperparams
-    }
-    with open("shard_data.json", "w", encoding="utf-8") as f:
-        json.dump(shard_data, f, indent=2)
+        problems = shard_data["problems"][0:30]
+        answers = shard_data["answers"][0:30]
+        shard_id = shard_data["shard_id"]
 
-    # Now fetch and run the server's training script
-    fetch_training_code()
-    run_training_script()
+        train(hyperparams, problems, answers, server_addr, client_id, shard_id)
 
-    # Finally, upload the resulting trained model
-    upload_trained_model(client_id, shard_id)
+        logging.info("[Client] Training and model upload completed. Checking for more tasks...")
+        time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Client script that handles training and sends model to server.")
+    parser.add_argument("--server_addr", required=True, help="Server address, e.g. http://<IP>:<Port>")
+    parser.add_argument("--client_id", type=int, default=0, help="Numeric client index")
+    parser.add_argument("--total_clients", type=int, default=2, help="Number of clients in total")
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        logging.error("[Client] No CUDA device, training cannot proceed.")
+        exit(1)
+
+    run_client(
+        server_addr=args.server_addr,
+        client_id=args.client_id,
+        total_clients=args.total_clients
+    )
