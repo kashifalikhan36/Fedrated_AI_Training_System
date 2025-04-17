@@ -1,179 +1,128 @@
-import os
-import io
-import time
-import argparse
-import logging
-import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import requests
+import torch
+import json
+import io
+import subprocess
+import os
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+SERVER_URL = "http://20.244.34.219:5000"
 
-# Check for GPU availability
-if not torch.cuda.is_available():
-    print("Not compatible - No CUDA Based GPU Found")
-    exit(1)
+def check_gpu():
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
 
-##############################
-#      LOCAL TRAINING CODE   #
-##############################
+def notify_server_gpu_has_arrived():
+    url = f"{SERVER_URL}/gpu_has_arrived"
+    response = requests.get(url)
+    print("Server response:", response.json())
 
-def train(hyperparams, problems, answers):
+def get_hyperparameters():
+    url = f"{SERVER_URL}/get_hyperparameters"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print("Hyperparameters not yet available.")
+        return None
+
+def get_dataset_shard(client_id, total_clients):
+    url = f"{SERVER_URL}/get_dataset_shard?client_id={client_id}&total_clients={total_clients}"
+    response = requests.get(url)
+    data = response.json()
+    if "problems" in data and "answers" in data and "shard_id" in data:
+        return data
+    print("Shard not available or assigned. Details:", data)
+    return None
+
+def fetch_training_code():
     """
-    Performs local training on a GPU.
-    If no CUDA GPU is detected, the script exits above.
+    Fetches the full training script from the server (GET /get_client_script)
+    and writes it to 'server_training_script.py'.
+    This script will use the local shard_data.json file when training.
     """
-    device = torch.device("cuda")
-    logging.info(f"[Client] Running single GPU training on {device}...")
+    url = f"{SERVER_URL}/get_client_script"
+    response = requests.get(url)
+    if response.status_code == 200:
+        script_content = response.json().get("client_script", "")
+        with open("server_training_script.py", "w", encoding="utf-8") as f:
+            f.write(script_content)
+        print("Fetched and saved the server training script: server_training_script.py")
+    else:
+        print("Failed to fetch the server training script.")
+        script_content = None
+    return script_content
 
-    lr = hyperparams.get("lr", 2e-5)
-    epochs = hyperparams.get("epochs", 2)
-    batch_size = hyperparams.get("batch_size", 2)
-    max_length = hyperparams.get("max_length", 128)
-
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    class TextDataset(Dataset):
-        def __init__(self, problems_list, answers_list, tokenizer, max_length):
-            self.texts = [p + " " + a for p, a in zip(problems_list, answers_list)]
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-
-        def __len__(self):
-            return len(self.texts)
-
-        def __getitem__(self, idx):
-            enc = self.tokenizer(
-                self.texts[idx],
-                max_length=self.max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors="pt"
-            )
-            return {k: v.squeeze(0) for k, v in enc.items()}
-
-    dataset_obj = TextDataset(problems, answers, tokenizer, max_length)
-    dataloader = DataLoader(
-        dataset_obj,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0 if os.name == 'nt' else 4
-    )
-
-    model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scaler = GradScaler()
-
-    total_steps = len(dataloader) * epochs
-    start_time = time.time()
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0.0
-        for step, batch in enumerate(dataloader):
-            inputs = batch["input_ids"].to(device)
-            labels = inputs.clone()
-
-            with autocast():
-                outputs = model(inputs, labels=labels)
-                loss = outputs.loss
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-            epoch_loss += loss.item()
-
-            if step % 10 == 0:
-                logging.info(f"[Epoch {epoch} | Step {step}] Loss: {loss.item():.4f}")
-
-            # Estimate remaining training time
-            steps_done = (epoch * len(dataloader)) + (step + 1)
-            elapsed_time = time.time() - start_time
-            avg_time_per_step = elapsed_time / steps_done if steps_done else 0
-            steps_left = total_steps - steps_done
-            remaining_time = steps_left * avg_time_per_step
-            if step % 10 == 0:
-                logging.info(f"[Client] Approx. remaining time: {remaining_time:.2f} seconds")
-
-        logging.info(f"[Epoch {epoch}] Avg Loss: {epoch_loss / len(dataloader):.4f}")
-
-    buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
-    buffer.seek(0)
-    logging.info("[Client] Training completed successfully")
-    return buffer.getvalue()
-
-
-##############################
-#         FASTAPI CLIENT     #
-##############################
-
-def run_client(aggregator_addr: str, server_addr: str, client_id: int, total_clients: int):
+def run_training_script():
     """
-    Steps:
-      1) Fetch hyperparameters from the server.
-      2) Request dataset shard from the server.
-      3) Train locally on GPU.
-      4) Upload model to the aggregator.
+    Runs 'server_training_script.py' as a separate process.
+    This script should read shard_data.json and produce a trained_model.pth file.
     """
-    # Fetch hyperparameters
-    try:
-        response = requests.get(f"{server_addr}/get_hyperparameters")
-        hyperparams = response.json()
-        logging.info(f"[Client] Hyperparameters: {hyperparams}")
-    except Exception as e:
-        logging.error(f"[Client] Could not retrieve hyperparameters: {e}")
+    if not os.path.exists("server_training_script.py"):
+        print("No training script found. Make sure fetch_training_code() ran first.")
+        return
+    subprocess.run(["python", "server_training_script.py"])
+
+def upload_trained_model(client_id, shard_id):
+    """
+    Reads the 'trained_model.pth' file and uploads it to the server.
+    """
+    if not os.path.exists("trained_model.pth"):
+        print("No trained_model.pth found. Make sure the training script produced it.")
         return
 
-    # Get dataset shard
-    try:
-        shard_resp = requests.get(
-            f"{server_addr}/get_dataset_shard",
-            params={"client_id": client_id, "total_clients": total_clients}
-        )
-        shard_data = shard_resp.json()
-        problems = shard_data["problems"]
-        answers = shard_data["answers"]
-        logging.info(f"[Client] Received dataset shard with {len(problems)} samples")
-    except Exception as e:
-        logging.error(f"[Client] Failed to retrieve dataset shard: {e}")
+    with open("trained_model.pth", "rb") as model_file:
+        model_data = model_file.read()
+
+    files = {"model": ("trained_model.pth", model_data)}
+    url = f"{SERVER_URL}/upload_model?client_id={client_id}&shard_id={shard_id}"
+    response = requests.post(url, files=files)
+    print("Upload response:", response.json())
+
+def main():
+    device = check_gpu()
+    if device.startswith("cuda"):
+        print("GPU is available on this client.")
+        notify_server_gpu_has_arrived()
+    else:
+        print("No GPU found. Proceeding with CPU.")
+
+    # Get the hyperparameters
+    hyperparams = get_hyperparameters()
+    if hyperparams is None:
+        print("Hyperparams are not ready yet. Exiting.")
         return
 
-    # Train locally
-    model_bytes = train(hyperparams, problems, answers)
+    # Example client info
+    client_id = 0
+    total_clients = 5
 
-    # Upload trained model to aggregator
-    buffer = io.BytesIO(model_bytes)
-    url = f"{aggregator_addr}/upload_client_model"
-    files = {"model": ("client_model.pth", buffer.getvalue())}
+    shard_info = get_dataset_shard(client_id, total_clients)
+    if not shard_info:
+        print("No shard assigned; nothing to train.")
+        return
 
-    try:
-        resp = requests.post(url, files=files)
-        logging.info(f"[Client] Model upload response: {resp.json()}")
-    except Exception as e:
-        logging.error(f"[Client] Failed to upload model: {e}")
+    # Extract the shard data
+    shard_id = shard_info["shard_id"]
+    problems = shard_info["problems"]
+    answers = shard_info["answers"]
 
+    # Save shard data to a JSON file so the server_training_script can use it
+    shard_data = {
+        "shard_id": shard_id,
+        "problems": problems,
+        "answers": answers,
+        "hyperparams": hyperparams
+    }
+    with open("shard_data.json", "w", encoding="utf-8") as f:
+        json.dump(shard_data, f, indent=2)
+
+    # Now fetch and run the server's training script
+    fetch_training_code()
+    run_training_script()
+
+    # Finally, upload the resulting trained model
+    upload_trained_model(client_id, shard_id)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GPU-based client for Federated Training")
-    parser.add_argument("--aggregator_addr", type=str, required=True, help="Aggregator address (http://<ip>:<port>)")
-    parser.add_argument("--server_addr", type=str, required=True, help="Server address (http://<ip>:<port>)")
-    parser.add_argument("--client_id", type=int, default=0, help="Client index ID (0-based)")
-    parser.add_argument("--total_clients", type=int, default=2, help="Total number of clients")
-    args = parser.parse_args()
-
-    run_client(
-        aggregator_addr=args.aggregator_addr,
-        server_addr=args.server_addr,
-        client_id=args.client_id,
-        total_clients=args.total_clients
-    )
+    main()
