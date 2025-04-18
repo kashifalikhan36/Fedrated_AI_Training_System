@@ -286,6 +286,7 @@ if __name__ == "__main__":
     if __name__ == "__main__":
         print_banner("Distributed AI")
         print_banner("Training Model")
+        time.sleep(2)
     run_client(
         server_addr=args.server_addr,
         client_id=args.client_id,
