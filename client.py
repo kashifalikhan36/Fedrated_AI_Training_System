@@ -36,7 +36,7 @@ def local_hyperparam_search():
 
     study = optuna.create_study(direction="maximize")
     # 5 minute local search was mentioned, but time=3 is in code; keep as-is.
-    study.optimize(local_objective, timeout=3)
+    study.optimize(local_objective)
     return study.best_params
 
 def post_local_hyperparams_to_server(server_addr: str, hyperparams: dict):
@@ -44,7 +44,7 @@ def post_local_hyperparams_to_server(server_addr: str, hyperparams: dict):
     Submit local hyperparams to server if the server doesn't have any yet.
     """
     try:
-        resp = requests.post(f"{server_addr}/submit_hyperparameters", json=hyperparams, timeout=30)
+        resp = requests.post(f"{server_addr}/submit_hyperparameters", json=hyperparams)
         if resp.status_code == 200:
             logging.info("[Client] Successfully submitted local hyperparams to server.")
         else:
@@ -57,7 +57,7 @@ def get_server_hyperparameters(server_addr: str):
     Fetch best hyperparams from the server. Returns None if not available.
     """
     try:
-        resp = requests.get(f"{server_addr}/get_hyperparameters", timeout=30)
+        resp = requests.get(f"{server_addr}/get_hyperparameters")
         if resp.status_code == 200:
             return resp.json()
         elif resp.status_code == 503:
@@ -77,8 +77,7 @@ def get_server_dataset_shard(server_addr: str, client_id: int, total_clients: in
     try:
         shard_resp = requests.get(
             f"{server_addr}/get_dataset_shard",
-            params={"client_id": client_id, "total_clients": total_clients},
-            timeout=60
+            params={"client_id": client_id, "total_clients": total_clients}
         )
         if shard_resp.status_code == 200:
             # The code checks again for the same status but with a message,
@@ -100,7 +99,7 @@ def notify_server_of_gpu_start(server_addr: str):
     Let server know that this client has a GPU, which can prune CPU-based hyperparam search.
     """
     try:
-        resp = requests.get(f"{server_addr}/gpu_has_arrived", timeout=20)
+        resp = requests.get(f"{server_addr}/gpu_has_arrived")
         if resp.status_code != 200:
             logging.warning(f"[Client] GPU start notification returned {resp.status_code}")
     except Exception as e:
@@ -223,7 +222,7 @@ def train(hyperparams: dict, problems: list, answers: list, server_addr: str, cl
         url = f"{server_addr}/upload_model"
         files = {"model": ("client_model.pth", buf.getvalue())}
         data = {"client_id": client_id, "shard_id": shard_id}
-        resp = requests.post(url, files=files, data=data, timeout=60)
+        resp = requests.post(url, files=files, data=data)
         logging.info(f"[Client] Model upload response: {resp.text}")
     except Exception as e:
         logging.error(f"[Client] Model upload failed: {e}")
