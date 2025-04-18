@@ -37,6 +37,7 @@ model_shards_assigned = []
 split_model_lock = threading.Lock()
 clients_completed_model_shards = []
 shards_count = 0
+model_data_info="current_model_info.json"
 
 def objective(trial: optuna.Trial) -> float:
     global cpu_pruned_once
@@ -171,7 +172,13 @@ def startup_event():
     global num_clients_needed
     global task_status
     logging.info("[Server] Loading dataset at startup...")
-    server_dataset = load_dataset("open-r1/OpenR1-Math-220k")
+    dataset_list = [
+    "open-r1/OpenR1-Math-220k",
+    "nvidia/OpenCodeReasoning",
+    "openai/mrcr",
+    "nvidia/Llama-Nemotron-Post-Training-Dataset"
+    ]
+    server_dataset = load_dataset(dataset_list[0])
     logging.info("[Server] Dataset loaded successfully.")
     if os.path.exists(hyperparams_file):
         with open(hyperparams_file, "r") as f:
@@ -192,15 +199,29 @@ def gpu_has_arrived():
         logging.info("[Server] GPU arrived.")
     return {"message": "GPU acknowledged; CPU-based search will be stopped if running."}
 
+@app.get("/get_model_train_data")
+def model_data_train():
+    data={
+  "time": "0:08",          
+  "earn": "99",         
+  "data_size": "128MB", 
+  "samples": 15000  
+} #make a way to generate the detail of task ongaing
+    return data
+
+@app.get("/new_model_info_train")
+def modal_data_train():
+    data={}   #mke a way to generate teh detaisl of sikip task
+    return data
+
+
 @app.get("/data_info_to_train")
 def gpu_has_arrived(json_data: str = Query(..., description="JSON data as a string")):
     try:
         # Decode and parse JSON string
         decoded = urllib.parse.unquote(json_data)
         data = json.loads(decoded)
-
-        # Save to file
-        with open("task_info.json", "w") as f:
+        with open("current_model_info.json", "w") as f:
             json.dump(data, f, indent=4)
 
         return {"message": "Task info received and saved."}
@@ -395,7 +416,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Server for HPC & Federated Examples")
     parser.add_argument("--port", type=int, default=5000, help="Port to run server on")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host address to listen on")
-    parser.add_argument("--num_clients_gpu", type=int, default=3, help="Number of clients needed to complete task (for GPU devices). 0 means all clients")
+    parser.add_argument("--num_clients_gpu", type=int, default=2, help="Number of clients needed to complete task (for GPU devices). 0 means all clients")
     args = parser.parse_args()
     if args.num_clients_gpu != 0 and args.num_clients_gpu < 2:
         raise ValueError("At least 2 clients are required for federated distributed learning")

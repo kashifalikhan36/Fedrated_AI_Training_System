@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import requests
 import optuna
 import json
+import pyfiglet
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -278,6 +279,13 @@ if __name__ == "__main__":
     parser.add_argument("--total_clients", type=int, default=2, help="Number of clients in total")
     args = parser.parse_args()
 
+    def print_banner(text: str, font: str = "slant"):
+        ascii_banner = pyfiglet.figlet_format(text, font=font)
+        print(ascii_banner)
+
+    if __name__ == "__main__":
+        print_banner("Distributed AI")
+        print_banner("Training Model")
     run_client(
         server_addr=args.server_addr,
         client_id=args.client_id,
