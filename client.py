@@ -278,10 +278,6 @@ if __name__ == "__main__":
     parser.add_argument("--total_clients", type=int, default=2, help="Number of clients in total")
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        logging.error("[Client] No CUDA device, training cannot proceed.")
-        exit(1)
-
     run_client(
         server_addr=args.server_addr,
         client_id=args.client_id,
