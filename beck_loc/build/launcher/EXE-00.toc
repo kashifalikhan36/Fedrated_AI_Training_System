@@ -285,7 +285,7 @@
  [],
  False,
  False,
- 1744938491,
+ 1744939228,
  [('run.exe',
    'C:\\Users\\kashi\\AppData\\Local\\pypoetry\\Cache\\virtualenvs\\cad3dify-vyPIcNut-py3.12\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\run.exe',
    'EXECUTABLE')],
